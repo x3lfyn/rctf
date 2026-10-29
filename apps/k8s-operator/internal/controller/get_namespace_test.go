@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	rctfv1 "github.com/otter-sec/rctf/api/v1"
+	"github.com/traefik/traefik/v2/pkg/provider/kubernetes/crd/traefikio/v1alpha1"
 )
 
 var dns1123Label = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
@@ -49,6 +50,80 @@ func TestGetNamespaceForInstance(t *testing.T) {
 		other := getNamespaceForInstance(instanceFor("ce1c0eb0-04cb-4fad-ad23-d6194114a636", "0b44b0a7-4121-4624-bf96-5df7e185e5dd"))
 		if other == first {
 			t.Fatalf("expected different names for different ids, both are %q", first)
+		}
+	})
+}
+
+func TestExposeToObjectsExternalTLSTermination(t *testing.T) {
+	exposeFor := func(kind rctfv1.ExposeType) rctfv1.ChallengeInstanceExpose {
+		return rctfv1.ChallengeInstanceExpose{
+			Kind:          kind,
+			HostPrefix:    "app",
+			ContainerName: "app",
+			ContainerPort: 8080,
+		}
+	}
+
+	httpEntryPoints := func(t *testing.T, external bool) map[string]bool {
+		t.Helper()
+		objects := exposeToObjects(&rctfv1.ChallengeInstance{}, exposeFor(rctfv1.HTTP), "app.example.com", external)
+		if len(objects) != 1 {
+			t.Fatalf("expected 1 object for http expose, got %d", len(objects))
+		}
+		route, ok := objects[0].(*v1alpha1.IngressRoute)
+		if !ok {
+			t.Fatalf("expected an IngressRoute, got %T", objects[0])
+		}
+		entryPoints := map[string]bool{}
+		for _, ep := range route.Spec.EntryPoints {
+			entryPoints[ep] = true
+		}
+		return entryPoints
+	}
+
+	t.Run("default mode serves http exposes on web only", func(t *testing.T) {
+		entryPoints := httpEntryPoints(t, false)
+		if !entryPoints["web"] || entryPoints["websecure"] {
+			t.Fatalf("expected only the web entrypoint, got %v", entryPoints)
+		}
+	})
+
+	t.Run("external mode serves http exposes on web and websecure", func(t *testing.T) {
+		entryPoints := httpEntryPoints(t, true)
+		if !entryPoints["web"] || !entryPoints["websecure"] {
+			t.Fatalf("expected web and websecure entrypoints, got %v", entryPoints)
+		}
+	})
+
+	t.Run("default mode creates redirect middleware for https exposes", func(t *testing.T) {
+		objects := exposeToObjects(&rctfv1.ChallengeInstance{}, exposeFor(rctfv1.HTTPS), "app.example.com", false)
+		if len(objects) != 3 {
+			t.Fatalf("expected 3 objects for https expose in default mode, got %d", len(objects))
+		}
+		route, ok := objects[2].(*v1alpha1.IngressRoute)
+		if !ok {
+			t.Fatalf("expected an IngressRoute, got %T", objects[2])
+		}
+		if len(route.Spec.EntryPoints) != 1 || route.Spec.EntryPoints[0] != "websecure" {
+			t.Fatalf("expected the https route on websecure only, got %v", route.Spec.EntryPoints)
+		}
+	})
+
+	t.Run("external mode serves https exposes on both entrypoints without redirects", func(t *testing.T) {
+		objects := exposeToObjects(&rctfv1.ChallengeInstance{}, exposeFor(rctfv1.HTTPS), "app.example.com", true)
+		if len(objects) != 1 {
+			t.Fatalf("expected 1 object for https expose in external mode, got %d", len(objects))
+		}
+		route, ok := objects[0].(*v1alpha1.IngressRoute)
+		if !ok {
+			t.Fatalf("expected an IngressRoute, got %T", objects[0])
+		}
+		entryPoints := map[string]bool{}
+		for _, ep := range route.Spec.EntryPoints {
+			entryPoints[ep] = true
+		}
+		if !entryPoints["web"] || !entryPoints["websecure"] {
+			t.Fatalf("expected web and websecure entrypoints, got %v", entryPoints)
 		}
 	})
 }

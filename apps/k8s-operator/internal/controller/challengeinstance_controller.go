@@ -54,6 +54,10 @@ type ChallengeInstanceReconciler struct {
 	Scheme *runtime.Scheme
 
 	InstancerHost string
+	// ExternalTLSTermination makes instance routes plain HTTP on both the web
+	// and websecure entrypoints (no http->https redirects), for deployments
+	// where TLS is terminated by a proxy in front of the cluster.
+	ExternalTLSTermination bool
 }
 
 const (
@@ -574,7 +578,7 @@ func (r *ChallengeInstanceReconciler) deployResources(ctx context.Context, insta
 			continue
 		}
 
-		objects := exposeToObjects(instance, expose, endpoint.Host)
+		objects := exposeToObjects(instance, expose, endpoint.Host, r.ExternalTLSTermination)
 		for _, object := range objects {
 			_, err := ctrl.CreateOrUpdate(ctx, r.Client, object, func() error {
 				return ctrl.SetControllerReference(instance, object, r.Scheme)
@@ -631,39 +635,42 @@ func exposeTypeToPort(exposeType rctfv1.ExposeType) uint16 {
 	}
 }
 
-func exposeToObjects(instance *rctfv1.ChallengeInstance, expose rctfv1.ChallengeInstanceExpose, hostname string) []client.Object {
+func exposeToObjects(instance *rctfv1.ChallengeInstance, expose rctfv1.ChallengeInstanceExpose, hostname string, externalTLSTermination bool) []client.Object {
 	namespaceName := getNamespaceForInstance(instance)
 	baseName := fmt.Sprintf("%s-%d", expose.ContainerName, expose.ContainerPort)
 
-	switch expose.Kind {
-	// TCP is not supported (for now)
-	case rctfv1.HTTP:
-		return []client.Object{
-			&v1alpha1.IngressRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespaceName,
-					Name:      fmt.Sprintf("%s-http", baseName),
-					Labels: map[string]string{
-						labelManagedBy:   managedBy,
-						labelTeamId:      instance.Spec.TeamId,
-						labelChallengeId: instance.Spec.ChallengeId,
-					},
+	// With external TLS termination both entrypoints are plain HTTP, so
+	// instance routes can be served on either of them.
+	instanceEntryPoints := []string{"web"}
+	if externalTLSTermination {
+		instanceEntryPoints = []string{"web", "websecure"}
+	}
+
+	serviceIngressRoute := func(name string, entryPoints []string) *v1alpha1.IngressRoute {
+		return &v1alpha1.IngressRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespaceName,
+				Name:      name,
+				Labels: map[string]string{
+					labelManagedBy:   managedBy,
+					labelTeamId:      instance.Spec.TeamId,
+					labelChallengeId: instance.Spec.ChallengeId,
 				},
-				Spec: v1alpha1.IngressRouteSpec{
-					EntryPoints: []string{"web"},
-					Routes: []v1alpha1.Route{
-						{
-							Kind:     "Rule",
-							Match:    fmt.Sprintf("Host(`%s`)", hostname),
-							Priority: 10,
-							// TODO: traefik middlewares?
-							Services: []v1alpha1.Service{
-								{
-									LoadBalancerSpec: v1alpha1.LoadBalancerSpec{
-										Name:      expose.ContainerName,
-										Namespace: namespaceName,
-										Port:      intstr.FromInt32(int32(expose.ContainerPort)),
-									},
+			},
+			Spec: v1alpha1.IngressRouteSpec{
+				EntryPoints: entryPoints,
+				Routes: []v1alpha1.Route{
+					{
+						Kind:     "Rule",
+						Match:    fmt.Sprintf("Host(`%s`)", hostname),
+						Priority: 10,
+						// TODO: traefik middlewares?
+						Services: []v1alpha1.Service{
+							{
+								LoadBalancerSpec: v1alpha1.LoadBalancerSpec{
+									Name:      expose.ContainerName,
+									Namespace: namespaceName,
+									Port:      intstr.FromInt32(int32(expose.ContainerPort)),
 								},
 							},
 						},
@@ -671,7 +678,21 @@ func exposeToObjects(instance *rctfv1.ChallengeInstance, expose rctfv1.Challenge
 				},
 			},
 		}
+	}
+
+	switch expose.Kind {
+	// TCP is not supported (for now)
+	case rctfv1.HTTP:
+		return []client.Object{
+			serviceIngressRoute(fmt.Sprintf("%s-http", baseName), instanceEntryPoints),
+		}
 	case rctfv1.HTTPS:
+		if externalTLSTermination {
+			return []client.Object{
+				serviceIngressRoute(fmt.Sprintf("%s-https", baseName), instanceEntryPoints),
+			}
+		}
+
 		return []client.Object{
 			&v1alpha1.Middleware{
 				ObjectMeta: metav1.ObjectMeta{
@@ -725,37 +746,7 @@ func exposeToObjects(instance *rctfv1.ChallengeInstance, expose rctfv1.Challenge
 					},
 				},
 			},
-			&v1alpha1.IngressRoute{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespaceName,
-					Name:      fmt.Sprintf("%s-https", baseName),
-					Labels: map[string]string{
-						labelManagedBy:   managedBy,
-						labelTeamId:      instance.Spec.TeamId,
-						labelChallengeId: instance.Spec.ChallengeId,
-					},
-				},
-				Spec: v1alpha1.IngressRouteSpec{
-					EntryPoints: []string{"websecure"},
-					Routes: []v1alpha1.Route{
-						{
-							Kind:     "Rule",
-							Match:    fmt.Sprintf("Host(`%s`)", hostname),
-							Priority: 10,
-							// TODO: traefik middlewares?
-							Services: []v1alpha1.Service{
-								{
-									LoadBalancerSpec: v1alpha1.LoadBalancerSpec{
-										Name:      expose.ContainerName,
-										Namespace: namespaceName,
-										Port:      intstr.FromInt32(int32(expose.ContainerPort)),
-									},
-								},
-							},
-						},
-					},
-				},
-			},
+			serviceIngressRoute(fmt.Sprintf("%s-https", baseName), []string{"websecure"}),
 		}
 	case rctfv1.TCP_SSL:
 		return []client.Object{
