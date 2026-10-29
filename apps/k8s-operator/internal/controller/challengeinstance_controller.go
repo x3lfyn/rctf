@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -75,6 +77,10 @@ const (
 	reasonInProgress            = "InProgress"
 	reasonSucceeded             = "Succeeded"
 	reasonDeployFailed          = "DeployFailed"
+
+	// Kubernetes namespace names must be valid RFC 1123 labels (max 63 chars).
+	namespaceNameMaxLength = 63
+	namespaceHashLength    = 8
 )
 
 // +kubebuilder:rbac:groups=rctf.osec.io,resources=challengeinstances,verbs=get;list;watch;create;update;patch;delete
@@ -89,11 +95,24 @@ const (
 // +kubebuilder:rbac:groups=traefik.io,resources=middlewares,verbs=get;list;watch;create;update;patch;delete
 
 func getNamespaceForInstance(instance *rctfv1.ChallengeInstance) string {
-	return fmt.Sprintf(
+	name := fmt.Sprintf(
 		"inst-%s-%s",
 		strings.ToLower(instance.Spec.ChallengeId),
 		strings.ToLower(instance.Spec.TeamId),
 	)
+
+	// Namespace names are limited to 63 characters. With UUID-shaped
+	// challenge/team IDs the combined name is longer, so truncate it and
+	// append a short hash of the full name to keep it collision-resistant.
+	if len(name) <= namespaceNameMaxLength {
+		return name
+	}
+
+	sum := sha256.Sum256([]byte(name))
+	hash := hex.EncodeToString(sum[:])[:namespaceHashLength]
+
+	trimmed := strings.TrimRight(name[:namespaceNameMaxLength-len(hash)-1], "-")
+	return fmt.Sprintf("%s-%s", trimmed, hash)
 }
 
 func getInstanceUIDHostSuffix(instance *rctfv1.ChallengeInstance) string {
